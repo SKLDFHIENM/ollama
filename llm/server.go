@@ -60,7 +60,12 @@ type llmServer struct {
 	sem *semaphore.Weighted
 }
 
-func LoadModel(model string) (*GGML, error) {
+// LoadModel will load a model from disk. The model must be in the GGML format.
+//
+// It collects array values for arrays with a size less than or equal to
+// maxArraySize. If maxArraySize is 0, the default value of 1024 is used. If
+// the maxArraySize is negative, all arrays are collected.
+func LoadModel(model string, maxArraySize int) (*GGML, error) {
 	if _, err := os.Stat(model); err != nil {
 		return nil, err
 	}
@@ -71,17 +76,27 @@ func LoadModel(model string) (*GGML, error) {
 	}
 	defer f.Close()
 
-	ggml, _, err := DecodeGGML(f)
+	ggml, _, err := DecodeGGML(f, maxArraySize)
 	return ggml, err
 }
 
 // NewLlamaServer will run a server for the given GPUs
 // The gpu list must be a single family.
-func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, projectors []string, opts api.Options) (LlamaServer, error) {
+func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, projectors []string, opts api.Options, numParallel int) (LlamaServer, error) {
 	var err error
 	var cpuRunner string
 	var estimate MemoryEstimate
-	var systemMemory uint64
+	var systemTotalMemory uint64
+	var systemFreeMemory uint64
+
+	systemMemInfo, err := gpu.GetCPUMem()
+	if err != nil {
+		slog.Error("failed to lookup system memory", "error", err)
+	} else {
+		systemTotalMemory = systemMemInfo.TotalMemory
+		systemFreeMemory = systemMemInfo.FreeMemory
+		slog.Debug("system memory", "total", format.HumanBytes2(systemTotalMemory), "free", systemFreeMemory)
+	}
 
 	// If the user wants zero GPU layers, reset the gpu list to be CPU/system ram info
 	if opts.NumGPU == 0 {
@@ -91,19 +106,10 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		cpuRunner = serverForCpu()
 		estimate = EstimateGPULayers(gpus, ggml, projectors, opts)
 	} else {
-		if gpus[0].Library == "metal" {
-			memInfo, err := gpu.GetCPUMem()
-			if err != nil {
-				slog.Error("failed to lookup system memory", "error", err)
-			} else {
-				systemMemory = memInfo.TotalMemory
-				slog.Debug("system memory", "total", format.HumanBytes2(systemMemory))
-			}
-		}
 		estimate = EstimateGPULayers(gpus, ggml, projectors, opts)
 
 		switch {
-		case gpus[0].Library == "metal" && estimate.VRAMSize > systemMemory:
+		case gpus[0].Library == "metal" && estimate.VRAMSize > systemTotalMemory:
 			// disable partial offloading when model is greater than total system memory as this
 			// can lead to locking up the system
 			opts.NumGPU = 0
@@ -115,6 +121,8 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			opts.NumGPU = estimate.Layers
 		}
 	}
+
+	estimate.log()
 
 	// Loop through potential servers
 	finalErr := errors.New("no suitable llama servers found")
@@ -200,7 +208,7 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		if g.Library == "metal" &&
 			uint64(opts.NumGPU) > 0 &&
 			uint64(opts.NumGPU) < ggml.KV().BlockCount()+1 {
-			opts.UseMMap = false
+			opts.UseMMap = api.TriStateFalse
 		}
 	}
 
@@ -208,7 +216,13 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		params = append(params, "--flash-attn")
 	}
 
-	if !opts.UseMMap {
+	// Windows CUDA should not use mmap for best performance
+	// Linux  with a model larger than free space, mmap leads to thrashing
+	// For CPU loads we want the memory to be allocated, not FS cache
+	if (runtime.GOOS == "windows" && gpus[0].Library == "cuda" && opts.UseMMap == api.TriStateUndefined) ||
+		(runtime.GOOS == "linux" && systemFreeMemory < estimate.TotalSize && opts.UseMMap == api.TriStateUndefined) ||
+		(gpus[0].Library == "cpu" && opts.UseMMap == api.TriStateUndefined) ||
+		opts.UseMMap == api.TriStateFalse {
 		params = append(params, "--no-mmap")
 	}
 
@@ -218,15 +232,6 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 
 	if opts.UseNUMA {
 		params = append(params, "--numa")
-	}
-
-	numParallel := envconfig.NumParallel
-
-	// TODO (jmorganca): multimodal models don't support parallel yet
-	// see https://github.com/ollama/ollama/issues/4165
-	if len(projectors) > 0 {
-		numParallel = 1
-		slog.Warn("multimodal models don't support parallel requests yet")
 	}
 
 	params = append(params, "--parallel", fmt.Sprintf("%d", numParallel))
@@ -271,8 +276,8 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		if runtime.GOOS == "windows" {
 			pathEnv = "PATH"
 		}
-		// prepend the server directory to LD_LIBRARY_PATH/PATH
-		libraryPaths := []string{dir}
+		// prepend the server directory to LD_LIBRARY_PATH/PATH and the parent dir for common dependencies
+		libraryPaths := []string{dir, filepath.Dir(dir)}
 
 		if libraryPath, ok := os.LookupEnv(pathEnv); ok {
 			// Append our runner directory to the path
@@ -320,6 +325,10 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 		s.cmd.Stdout = os.Stdout
 		s.cmd.Stderr = s.status
 
+		envWorkarounds := [][2]string{}
+		for _, gpu := range gpus {
+			envWorkarounds = append(envWorkarounds, gpu.EnvWorkarounds...)
+		}
 		visibleDevicesEnv, visibleDevicesEnvVal := gpus.GetVisibleDevicesEnv()
 		pathEnvVal := strings.Join(libraryPaths, string(filepath.ListSeparator))
 
@@ -334,6 +343,12 @@ func NewLlamaServer(gpus gpu.GpuInfoList, model string, ggml *GGML, adapters, pr
 			} else if devicesNeeded && strings.EqualFold(cmp[0], visibleDevicesEnv) {
 				s.cmd.Env[i] = visibleDevicesEnv + "=" + visibleDevicesEnvVal
 				devicesNeeded = false
+			} else if len(envWorkarounds) != 0 {
+				for _, kv := range envWorkarounds {
+					if strings.EqualFold(cmp[0], kv[0]) {
+						s.cmd.Env[i] = kv[0] + "=" + kv[1]
+					}
+				}
 			}
 		}
 		if pathNeeded {
@@ -395,7 +410,7 @@ func projectorMemoryRequirements(filename string) uint64 {
 	}
 	defer file.Close()
 
-	ggml, _, err := DecodeGGML(file)
+	ggml, _, err := DecodeGGML(file, 0)
 	if err != nil {
 		return 0
 	}
@@ -544,6 +559,9 @@ func (s *llmServer) WaitUntilRunning(ctx context.Context) error {
 			msg := ""
 			if s.status != nil && s.status.LastErrMsg != "" {
 				msg = s.status.LastErrMsg
+			}
+			if strings.Contains(msg, "unknown model") {
+				return fmt.Errorf("this model is not supported by your version of Ollama. You may need to upgrade")
 			}
 			return fmt.Errorf("llama runner process has terminated: %v %s", err, msg)
 		default:

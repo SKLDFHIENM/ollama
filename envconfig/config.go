@@ -57,6 +57,19 @@ var (
 	SchedSpread bool
 	// Set via OLLAMA_TMPDIR in the environment
 	TmpDir string
+	// Set via OLLAMA_INTEL_GPU in the environment
+	IntelGpu bool
+
+	// Set via CUDA_VISIBLE_DEVICES in the environment
+	CudaVisibleDevices string
+	// Set via HIP_VISIBLE_DEVICES in the environment
+	HipVisibleDevices string
+	// Set via ROCR_VISIBLE_DEVICES in the environment
+	RocrVisibleDevices string
+	// Set via GPU_DEVICE_ORDINAL in the environment
+	GpuDeviceOrdinal string
+	// Set via HSA_OVERRIDE_GFX_VERSION in the environment
+	HsaOverrideGfxVersion string
 )
 
 type EnvVar struct {
@@ -66,24 +79,33 @@ type EnvVar struct {
 }
 
 func AsMap() map[string]EnvVar {
-	return map[string]EnvVar{
+	ret := map[string]EnvVar{
 		"OLLAMA_DEBUG":             {"OLLAMA_DEBUG", Debug, "Show additional debug information (e.g. OLLAMA_DEBUG=1)"},
 		"OLLAMA_FLASH_ATTENTION":   {"OLLAMA_FLASH_ATTENTION", FlashAttention, "Enabled flash attention"},
 		"OLLAMA_HOST":              {"OLLAMA_HOST", Host, "IP Address for the ollama server (default 127.0.0.1:11434)"},
 		"OLLAMA_KEEP_ALIVE":        {"OLLAMA_KEEP_ALIVE", KeepAlive, "The duration that models stay loaded in memory (default \"5m\")"},
 		"OLLAMA_LLM_LIBRARY":       {"OLLAMA_LLM_LIBRARY", LLMLibrary, "Set LLM library to bypass autodetection"},
-		"OLLAMA_MAX_LOADED_MODELS": {"OLLAMA_MAX_LOADED_MODELS", MaxRunners, "Maximum number of loaded models (default 1)"},
+		"OLLAMA_MAX_LOADED_MODELS": {"OLLAMA_MAX_LOADED_MODELS", MaxRunners, "Maximum number of loaded models per GPU"},
 		"OLLAMA_MAX_QUEUE":         {"OLLAMA_MAX_QUEUE", MaxQueuedRequests, "Maximum number of queued requests"},
 		"OLLAMA_MAX_VRAM":          {"OLLAMA_MAX_VRAM", MaxVRAM, "Maximum VRAM"},
 		"OLLAMA_MODELS":            {"OLLAMA_MODELS", ModelsDir, "The path to the models directory"},
 		"OLLAMA_NOHISTORY":         {"OLLAMA_NOHISTORY", NoHistory, "Do not preserve readline history"},
 		"OLLAMA_NOPRUNE":           {"OLLAMA_NOPRUNE", NoPrune, "Do not prune model blobs on startup"},
-		"OLLAMA_NUM_PARALLEL":      {"OLLAMA_NUM_PARALLEL", NumParallel, "Maximum number of parallel requests (default 1)"},
+		"OLLAMA_NUM_PARALLEL":      {"OLLAMA_NUM_PARALLEL", NumParallel, "Maximum number of parallel requests"},
 		"OLLAMA_ORIGINS":           {"OLLAMA_ORIGINS", AllowOrigins, "A comma separated list of allowed origins"},
 		"OLLAMA_RUNNERS_DIR":       {"OLLAMA_RUNNERS_DIR", RunnersDir, "Location for runners"},
 		"OLLAMA_SCHED_SPREAD":      {"OLLAMA_SCHED_SPREAD", SchedSpread, "Always schedule model across all GPUs"},
 		"OLLAMA_TMPDIR":            {"OLLAMA_TMPDIR", TmpDir, "Location for temporary files"},
 	}
+	if runtime.GOOS != "darwin" {
+		ret["CUDA_VISIBLE_DEVICES"] = EnvVar{"CUDA_VISIBLE_DEVICES", CudaVisibleDevices, "Set which NVIDIA devices are visible"}
+		ret["HIP_VISIBLE_DEVICES"] = EnvVar{"HIP_VISIBLE_DEVICES", HipVisibleDevices, "Set which AMD devices are visible"}
+		ret["ROCR_VISIBLE_DEVICES"] = EnvVar{"ROCR_VISIBLE_DEVICES", RocrVisibleDevices, "Set which AMD devices are visible"}
+		ret["GPU_DEVICE_ORDINAL"] = EnvVar{"GPU_DEVICE_ORDINAL", GpuDeviceOrdinal, "Set which AMD devices are visible"}
+		ret["HSA_OVERRIDE_GFX_VERSION"] = EnvVar{"HSA_OVERRIDE_GFX_VERSION", HsaOverrideGfxVersion, "Override the gfx used for all detected AMD GPUs"}
+		ret["OLLAMA_INTEL_GPU"] = EnvVar{"OLLAMA_INTEL_GPU", IntelGpu, "Enable experimental Intel GPU detection"}
+	}
+	return ret
 }
 
 func Values() map[string]string {
@@ -107,8 +129,8 @@ func clean(key string) string {
 
 func init() {
 	// default values
-	NumParallel = 1
-	MaxRunners = 1
+	NumParallel = 0 // Autoselect
+	MaxRunners = 0  // Autoselect
 	MaxQueuedRequests = 512
 
 	LoadConfig()
@@ -183,8 +205,8 @@ func LoadConfig() {
 
 	if onp := clean("OLLAMA_NUM_PARALLEL"); onp != "" {
 		val, err := strconv.Atoi(onp)
-		if err != nil || val <= 0 {
-			slog.Error("invalid setting must be greater than zero", "OLLAMA_NUM_PARALLEL", onp, "error", err)
+		if err != nil {
+			slog.Error("invalid setting, ignoring", "OLLAMA_NUM_PARALLEL", onp, "error", err)
 		} else {
 			NumParallel = val
 		}
@@ -229,7 +251,7 @@ func LoadConfig() {
 	if maxRunners != "" {
 		m, err := strconv.Atoi(maxRunners)
 		if err != nil {
-			slog.Error("invalid setting", "OLLAMA_MAX_LOADED_MODELS", maxRunners, "error", err)
+			slog.Error("invalid setting, ignoring", "OLLAMA_MAX_LOADED_MODELS", maxRunners, "error", err)
 		} else {
 			MaxRunners = m
 		}
@@ -238,7 +260,7 @@ func LoadConfig() {
 	if onp := os.Getenv("OLLAMA_MAX_QUEUE"); onp != "" {
 		p, err := strconv.Atoi(onp)
 		if err != nil || p <= 0 {
-			slog.Error("invalid setting", "OLLAMA_MAX_QUEUE", onp, "error", err)
+			slog.Error("invalid setting, ignoring", "OLLAMA_MAX_QUEUE", onp, "error", err)
 		} else {
 			MaxQueuedRequests = p
 		}
@@ -256,6 +278,16 @@ func LoadConfig() {
 	if err != nil {
 		slog.Error("invalid setting", "OLLAMA_HOST", Host, "error", err, "using default port", Host.Port)
 	}
+
+	if set, err := strconv.ParseBool(clean("OLLAMA_INTEL_GPU")); err == nil {
+		IntelGpu = set
+	}
+
+	CudaVisibleDevices = clean("CUDA_VISIBLE_DEVICES")
+	HipVisibleDevices = clean("HIP_VISIBLE_DEVICES")
+	RocrVisibleDevices = clean("ROCR_VISIBLE_DEVICES")
+	GpuDeviceOrdinal = clean("GPU_DEVICE_ORDINAL")
+	HsaOverrideGfxVersion = clean("HSA_OVERRIDE_GFX_VERSION")
 }
 
 func getModelsDir() (string, error) {
